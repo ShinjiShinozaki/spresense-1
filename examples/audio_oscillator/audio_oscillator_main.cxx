@@ -62,7 +62,9 @@
 #include "include/msgq_pool.h"
 #include "include/pool_layout.h"
 #include "include/fixed_fence.h"
-
+#ifdef EXAMPLES_AUDIO_OSCILLATOR_USEPPOSTPROC
+#include "userproc_command.h"
+#endif
 #include <arch/chip/cxd56_audio.h>
 
 /* Section number of memory layout to use */
@@ -81,7 +83,7 @@ using namespace MemMgrLite;
 
 /* Output time(sec). */
 
-#define OSCILLATOR_REC_TIME 10
+#define OSCILLATOR_REC_TIME 20
 
 /* Default Volume. -20dB */
 
@@ -103,61 +105,31 @@ using namespace MemMgrLite;
 
 static mpshm_t s_shm;
 
+static sem_t   s_sem;
+
 /****************************************************************************
  * Private Functions
  ****************************************************************************/
 
-static bool printAudCmdResult(uint8_t command_code, AudioResult& result)
+static void outputmixer0_done_callback(MsgQueId requester_dtq,
+                                       MsgType reply_of,
+                                       AsOutputMixDoneParam *done_param)
 {
-  if (AUDRLT_ERRORRESPONSE == result.header.result_code) {
-    printf("Command code(0x%x): AUDRLT_ERRORRESPONSE:"
-           "Module id(0x%x): Error code(0x%x)\n",
-            command_code,
-            result.error_response_param.module_id,
-            result.error_response_param.error_code);
-    return false;
-  }
-  else if (AUDRLT_ERRORATTENTION == result.header.result_code) {
-    printf("Command code(0x%x): AUDRLT_ERRORATTENTION\n", command_code);
-    return false;
-  }
+  sem_post(&s_sem);
+}
+
+static bool synthesizer_callback(AsSynthesizerEvent evtype,
+                                 uint32_t           result,
+                                 void              *instance)
+{
+  sem_post(&s_sem);
+
   return true;
-}
-
-static bool app_receive_object_reply(void)
-{
-  AudioObjReply reply_info;
-
-  return AS_ReceiveObjectReply(MSGQ_AUD_APP, &reply_info);
-}
-
-static void app_attention_callback(const ErrorAttentionParam *attparam)
-{
-  printf("Attention!! %s L%d ecode %d subcode %d\n",
-          attparam->error_filename,
-          attparam->line_number,
-          attparam->error_code,
-          attparam->error_att_sub_code);
 }
 
 static bool app_create_audio_sub_system(void)
 {
   bool result = true;
-
-  /* Create manager of AudioSubSystem. */
-
-  AudioSubSystemIDs ids;
-  ids.app         = MSGQ_AUD_APP;
-  ids.mng         = MSGQ_AUD_MGR;
-  ids.player_main = 0xFF;
-  ids.player_sub  = 0xFF;
-  ids.micfrontend = 0xFF;
-  ids.mixer       = 0xFF;
-  ids.recorder    = 0xFF;
-  ids.effector    = 0xFF;
-  ids.recognizer  = 0xFF;
-
-  AS_CreateAudioManager(ids, app_attention_callback);
 
   /* Create Oscillator. */
 
@@ -177,6 +149,8 @@ static bool app_create_audio_sub_system(void)
       printf("Error: AS_CreateMediaSynthesizer() failed. system memory insufficient!\n");
       return false;
     }
+
+  /* Create mixer feature. */
 
   AsCreateOutputMixParams_t output_mix_act_param;
   output_mix_act_param.msgq_id.mixer = MSGQ_AUD_OUTPUT_MIX;
@@ -215,14 +189,6 @@ static bool app_create_audio_sub_system(void)
 
 static void app_deact_audio_sub_system(void)
 {
-  /* Delete AudioManager. */
-
-  AS_DeleteAudioManager();
-
-  /* Delete Oscillator. */
-
-  AS_DeleteMediaSynthesizer();
-
   /* Delete OutputMixer. */
 
   AS_DeleteOutputMix();
@@ -230,6 +196,10 @@ static void app_deact_audio_sub_system(void)
   /* Delete Renderer. */
 
   AS_DeleteRenderer();
+
+  /* Delete Oscillator. */
+
+  AS_DeleteMediaSynthesizer();
 }
 
 static bool app_activate_baseband(void)
@@ -252,18 +222,55 @@ static bool app_activate_baseband(void)
 
   mixer_act.output_device = HPOutputDevice;
   mixer_act.mixer_type    = MainOnly;
+#ifdef EXAMPLES_AUDIO_OSCILLATOR_USEPPOSTPROC
+  mixer_act.post_enable   = PostFilterEnable;
+#else
   mixer_act.post_enable   = PostFilterDisable;
-  mixer_act.cb            = NULL;
+#endif
+  mixer_act.cb            = outputmixer0_done_callback;
 
   AS_ActivateOutputMixer(OutputMixer0, &mixer_act);
-
-  if (!app_receive_object_reply())
-    {
-      printf("AS_ActivateOutputMixer() error!\n");
-    }
+  sem_wait(&s_sem);
 
   return true;
 }
+
+#ifdef EXAMPLES_AUDIO_OSCILLATOR_USEPPOSTPROC
+
+static bool app_send_initpostproc_command(void)
+{
+  AsInitPostProc  init;
+  InitParam       initpostcmd;
+
+  init.addr = reinterpret_cast<uint8_t *>(&initpostcmd);
+  init.size = sizeof(initpostcmd);
+
+  AS_InitPostprocOutputMixer(OutputMixer0, &init);
+  sem_wait(&s_sem);
+
+  return true;
+}
+
+static bool app_send_setpostproc_command(void)
+{
+  AsSetPostProc set;
+  static SetParam      setpostcmd;
+  static bool   s_toggle = false;
+
+  s_toggle = (s_toggle) ? false : true;
+
+  setpostcmd.postswitch = s_toggle;
+
+  set.addr = reinterpret_cast<uint8_t *>(&setpostcmd);
+  set.size = sizeof(SetParam);
+
+  AS_SetPostprocOutputMixer(OutputMixer0, &set);
+  sem_wait(&s_sem);
+
+  return true;
+}
+
+#endif
 
 static bool app_deactivate_baseband(void)
 {
@@ -272,11 +279,7 @@ static bool app_deactivate_baseband(void)
   AsDeactivateOutputMixer mixer_deact;
 
   AS_DeactivateOutputMixer(OutputMixer0, &mixer_deact);
-
-  if (!app_receive_object_reply())
-    {
-      printf("AS_DeactivateOutputMixer() error!\n");
-    }
+  sem_wait(&s_sem);
 
   CXD56_AUDIO_ECODE error_code;
 
@@ -293,68 +296,16 @@ static bool app_deactivate_baseband(void)
   return true;
 }
 
-static bool app_power_on(void)
-{
-  AudioCommand command;
-  command.header.packet_length = LENGTH_POWERON;
-  command.header.command_code  = AUDCMD_POWERON;
-  command.header.sub_code      = 0x00;
-  command.power_on_param.enable_sound_effect = AS_DISABLE_SOUNDEFFECT;
-  AS_SendAudioCommand(&command);
-
-  AudioResult result;
-  AS_ReceiveAudioResult(&result);
-  return printAudCmdResult(command.header.command_code, result);
-}
-
-static bool app_power_off(void)
-{
-  AudioCommand command;
-  command.header.packet_length = LENGTH_SET_POWEROFF_STATUS;
-  command.header.command_code  = AUDCMD_SETPOWEROFFSTATUS;
-  command.header.sub_code      = 0x00;
-  AS_SendAudioCommand(&command);
-
-  AudioResult result;
-  AS_ReceiveAudioResult(&result);
-  return printAudCmdResult(command.header.command_code, result);
-}
-
-static bool app_set_ready(void)
-{
-  AudioCommand command;
-  command.header.packet_length = LENGTH_SET_READY_STATUS;
-  command.header.command_code  = AUDCMD_SETREADYSTATUS;
-  command.header.sub_code      = 0x00;
-  AS_SendAudioCommand(&command);
-
-  AudioResult result;
-  AS_ReceiveAudioResult(&result);
-  return printAudCmdResult(command.header.command_code, result);
-}
-
-static bool app_get_status(void)
-{
-  AudioCommand command;
-  command.header.packet_length = LENGTH_GETSTATUS;
-  command.header.command_code  = AUDCMD_GETSTATUS;
-  command.header.sub_code      = 0x00;
-  AS_SendAudioCommand(&command);
-
-  AudioResult result;
-  AS_ReceiveAudioResult(&result);
-  return result.notify_status.status_info;
-}
-
 static bool app_set_oscillator_status(void)
 {
   AsActivateSynthesizer act;
 
-  act.cb = NULL;
+  act.cb = synthesizer_callback;
 
   AS_ActivateMediaSynthesizer(&act);
+  sem_wait(&s_sem);
 
-  return app_receive_object_reply();
+  return true;
 }
 
 static bool app_init_oscillator()
@@ -362,40 +313,14 @@ static bool app_init_oscillator()
   AsInitSynthesizerParam  init;
 
   init.type          = AsSynthesizerSinWave;
-  init.channel_num   = AS_CHANNEL_STEREO;
-  init.sampling_rate = AS_SAMPLINGRATE_48000;       /* C sound [Hz] */
+  init.channel_num   = AS_CHANNEL_6CH;
+  init.sampling_rate = AS_SAMPLINGRATE_48000;
   init.bit_width     = AS_BITLENGTH_16;
 
-  sprintf(init.dsp_path, "%s/%s", DSPBIN_PATH, "PREPROC");
+  sprintf(init.dsp_path, "%s/%s", DSPBIN_PATH, "OSCPROC");
 
   AS_InitMediaSynthesizer(&init);
-
-  if (!app_receive_object_reply())
-    {
-      return false;
-    }
-
-  AsSetSynthesizer set_param;
-
-  set_param.channel_no = 0;
-  set_param.frequency  = 523;
-
-  AS_SetMediaSynthesizer(&set_param);
-
-  if (!app_receive_object_reply())
-    {
-      return false;
-    }
-
-  set_param.channel_no = 1;
-  set_param.frequency  = 623;
-
-  AS_SetMediaSynthesizer(&set_param);
-
-  if (!app_receive_object_reply())
-    {
-      return false;
-    }
+  sem_wait(&s_sem);
 
   return true;
 }
@@ -403,37 +328,57 @@ static bool app_init_oscillator()
 static bool app_start_oscillator(void)
 {
   AS_StartMediaSynthesizer();
+  sem_wait(&s_sem);
 
-  return app_receive_object_reply();
+  return true;
 }
 
 static bool app_stop_oscillator(void)
 {
   AS_StopMediaSynthesizer();
+  sem_wait(&s_sem);
 
-  return app_receive_object_reply();
+  return true;
 }
 
 static bool app_deactive_oscillator(void)
 {
+  AS_DeactivateMediaSynthesizer();
+  sem_wait(&s_sem);
+
   return true;
 }
 
-#ifdef CONFIG_EXAMPLES_AUDIO_OSCILLATOR_USEPREPROC
-#endif /* CONFIG_EXAMPLES_AUDIO_OSCILLATOR_USEPREPROC */
-
-static bool app_set_clkmode(int clk_mode)
+static bool app_set_frequency_oscillator(uint8_t channel_number, uint32_t *frequency)
 {
-  AudioCommand command;
-  command.header.packet_length = LENGTH_SETRENDERINGCLK;
-  command.header.command_code  = AUDCMD_SETRENDERINGCLK;
-  command.header.sub_code      = 0x00;
-  command.set_renderingclk_param.clk_mode = clk_mode;
-  AS_SendAudioCommand(&command);
+  AsSetSynthesizer set_param;
+  bool             res = true;
 
-  AudioResult result;
-  AS_ReceiveAudioResult(&result);
-  return printAudCmdResult(command.header.command_code, result);
+  for (int i = 0; i < channel_number; i++)
+    {
+      set_param.channel_no = i;
+      set_param.frequency  = frequency[i];
+
+      AS_SetMediaSynthesizer(&set_param);
+      sem_wait(&s_sem);
+    }
+
+  return res;
+}
+
+static bool app_set_clkmode(void)
+{
+  CXD56_AUDIO_ECODE error_code;
+
+  error_code = cxd56_audio_set_clkmode(CXD56_AUDIO_CLKMODE_NORMAL);
+
+  if (error_code != CXD56_AUDIO_ECODE_OK)
+    {
+      printf("cxd56_audio_set_clkmode() error! [%d]\n", error_code);
+      return false;
+    }
+
+  return true;
 }
 
 static bool app_set_volume(int master_db)
@@ -476,7 +421,7 @@ static bool app_init_libraries(void)
 
   /* Initialize shared memory.*/
 
-  ret = mpshm_init(&s_shm, 1, 1024 * 128 * 2);
+  ret = mpshm_init(&s_shm, 1, AUD_SRAM_SIZE);
   if (ret < 0)
     {
       printf("Error: mpshm_init() failure. %d\n", ret);
@@ -575,21 +520,83 @@ static bool app_finalize_libraries(void)
   return true;
 }
 
-void app_recorde_process(uint32_t rec_time)
+bool app_play_process(void)
 {
-  /* Timer Start */
-  time_t start_time;
-  time_t cur_time;
+  bool  res = true;
 
-  time(&start_time);
+  /* Define beep scale */
 
-  do
+  struct {
+    uint32_t  fs[6];
+  }
+  node[] = {
+    {131,  523,    0,    0,  523,  262},
+    {131,  523,    0,    0,    0,  294},
+    {147,  587,    0,    0,  587,  330},
+    {147,  587,    0,    0,    0,  349},
+    {165,  659,    0, 1046,  659,  392},
+    {165,  659,    0, 1174,    0,  440},
+    {175,  697,    0, 1318,  697,  494},
+    {175,  697,    0, 1397,    0,  523},
+    {196,  784,  262, 1568,  784,    0},
+    {196,  784,  294, 1760,    0,    0},
+    {220,  880,  330, 1976,  880,    0},
+    {220,  880,  349, 2093,    0,    0},
+    {247,  988,  392,    0,  988,    0},
+    {247,  988,  440,    0,    0,    0},
+    {262, 1046,  494,    0, 1046,    0},
+    {262, 1046,  523,    0,    0,    0},
+    {  0,    0,    0,    0,    0,    0}   /* Terminate */
+  },
+  *p_node = node;
+
+  /* Initial value setting */
+
+  if (!(res = app_set_frequency_oscillator(6, p_node->fs)))
     {
-      /* Check the FIFO every 5 ms and fill if there is space. */
+      printf("Error: app_set_frequency_oscillator() failure.\n");
+      goto errout_app_play_process;
+    }
 
-      usleep(5 * 1000);
+  /* Start oscillator operation. */
 
-    } while((time(&cur_time) - start_time) < rec_time);
+  if (!(res = app_start_oscillator()))
+    {
+      printf("Error: app_start_oscillator() failure.\n");
+      goto errout_app_play_process;
+    }
+
+  /* Running... */
+
+  printf("Running...\n");
+
+  for (; p_node->fs[0]; p_node++)
+    {
+      /* Set frequency. */
+
+      if (!(res = app_set_frequency_oscillator(6, p_node->fs)))
+        {
+          printf("Error: app_set_frequency_oscillator() failure.\n");
+          break;
+        }
+
+      usleep(1000 * 1000);
+
+#ifdef EXAMPLES_AUDIO_OSCILLATOR_USEPPOSTPROC
+      app_send_setpostproc_command();
+#endif
+    }
+
+  /* Stop oscillator operation. */
+
+  if (!(res = app_stop_oscillator()))
+    {
+      printf("Error: app_stop_operation() failure.\n");
+    }
+
+errout_app_play_process:
+
+  return res;
 }
 
 /****************************************************************************
@@ -604,9 +611,11 @@ extern "C" int audio_oscillator_main(int argc, char *argv[])
 {
   printf("Start AudioOscillator example\n");
 
+  sem_init(&s_sem, 0, 0);
+
   /* Waiting for SD card mounting. */
 
-  sleep(1);
+  sleep(2);
 
   /* First, initialize the shared memory and memory utility used by AudioSubSystem. */
 
@@ -626,12 +635,6 @@ extern "C" int audio_oscillator_main(int argc, char *argv[])
 
   /* Change AudioSubsystem to Ready state so that I/O parameters can be changed. */
 
-  if (!app_power_on())
-    {
-      printf("Error: app_power_on() failure.\n");
-      return 1;
-    }
-
   if (!app_activate_baseband())
     {
       printf("Error: app_activate_baseband() failure.\n");
@@ -640,9 +643,7 @@ extern "C" int audio_oscillator_main(int argc, char *argv[])
 
   /* Set audio clock mode. */
 
-  uint32_t sampling_rate = AS_SAMPLINGRATE_48000;
-
-  if (!app_set_clkmode((sampling_rate >= AS_SAMPLINGRATE_48000) ? AS_CLKMODE_HIRES : AS_CLKMODE_NORMAL))
+  if (!app_set_clkmode())
     {
       printf("Error: app_set_clkmode() failure.\n");
       return 1;
@@ -655,6 +656,14 @@ extern "C" int audio_oscillator_main(int argc, char *argv[])
       printf("Error: app_set_oscillator_status() failure.\n");
       return 1;
     }
+
+#ifdef EXAMPLES_AUDIO_OSCILLATOR_USEPPOSTPROC
+
+  /* Init Postproc. */
+
+  app_send_initpostproc_command();
+
+#endif
 
   /* Initialize Oscillator. */
 
@@ -676,25 +685,11 @@ extern "C" int audio_oscillator_main(int argc, char *argv[])
       return 1;
     }
 
-  /* Start oscillator operation. */
-
-  if (!app_start_oscillator())
-    {
-      printf("Error: app_start_oscillator() failure.\n");
-      return 1;
-    }
-
   /* Running... */
 
-  printf("Running time is %d sec\n", OSCILLATOR_REC_TIME);
-
-  app_recorde_process(OSCILLATOR_REC_TIME);
-
-  /* Stop oscillator operation. */
-
-  if (!app_stop_oscillator())
+  if (!app_play_process())
     {
-      printf("Error: app_stop_operation() failure.\n");
+      printf("Error: app_play_process() failure.\n");
       return 1;
     }
 
@@ -704,17 +699,6 @@ extern "C" int audio_oscillator_main(int argc, char *argv[])
     {
       printf("Error: board_external_amp_mute_control(true) failuer.\n");
       return 1;
-    }
-
-  /* Return the state of AudioSubSystem before voice_call operation. */
-
-  if (AS_MNG_STATUS_READY != app_get_status())
-    {
-      if (!app_set_ready())
-        {
-          printf("Error: app_set_ready() failure.\n");
-          return 1;
-        }
     }
 
   /* Unload oscillator operation. */
@@ -733,14 +717,6 @@ extern "C" int audio_oscillator_main(int argc, char *argv[])
       return 1;
     }
 
-  /* Change AudioSubsystem to PowerOff state. */
-
-  if (!app_power_off())
-    {
-      printf("Error: app_power_off() failure.\n");
-      return 1;
-    }
-
   /* Deactivate the features used by AudioSubSystem. */
 
   app_deact_audio_sub_system();
@@ -754,6 +730,8 @@ extern "C" int audio_oscillator_main(int argc, char *argv[])
     }
 
   printf("Exit AudioOscillator example\n");
+
+  sem_destroy(&s_sem);
 
   return 0;
 }

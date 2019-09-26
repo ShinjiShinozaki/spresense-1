@@ -49,13 +49,11 @@ LDLIBPATH += -L "$(SDKDIR)/lib"
 LDLIBS += -lasmpw -lc
 LDLIBS += -larm_cortexM4lf_math
 
-WORKER_ELF = PREPROC
+WORKER_ELF = OSCPROC
 
 VPATH += userproc/src
 
 CXXSRCS = main.cpp oscillator.cpp
-
-#LDLIBS += -larm_cortexM4lf_math
 
 CXXELFFLAGS += -Os
 ifeq ($(WINTOOL),y)
@@ -91,7 +89,7 @@ $(CXXOBJS): %$(OBJEXT):%.cpp
 
 # Build workers
 
-$(WORKER_ELF): $(CXXOBJS)
+$(WORKER_ELF): $(CXXOBJS) | $(CMSIS_DSP_LIB)
 	@echo "LD: $@"
 	$(Q) $(LD) -Map=tmp.map $(LDRAWELFFLAGS) $(LDLIBPATH) -o $@ $(ARCHCRT0OBJ) $^ $(LDLIBS)
 	$(Q) $(STRIP) -d $(WORKER_ELF)
